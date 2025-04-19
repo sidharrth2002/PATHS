@@ -137,7 +137,7 @@ class PATHSProcessor(nn.Module, Processor):
         #     nn.Linear(self.dim + self.hdim, self.dim + self.hdim)
         # )
         self.combine_transcriptomics_patch_ctx = CombineTranscriptomicsPatchCtx(
-            self.dim, self.hdim, get_num_transcriptomics_features(), dropout_p=0.2
+            self.dim, self.hdim, get_num_transcriptomics_features(transcriptomics_model_path=config.transcriptomics_model_path), dropout_p=0.2
         )
 
     def process(self, data: PatchBatch, lstm=None) -> Dict:
@@ -211,7 +211,7 @@ class PATHSProcessor(nn.Module, Processor):
                 self.importance_mlp(xs["contextualised_features"])
             ),
             patch_features,
-            transcriptomics,
+            # transcriptomics,
             data.valid_inds,
             1,
         )[..., 0]
@@ -234,39 +234,19 @@ class PATHSProcessor(nn.Module, Processor):
 
         # append transcriptomics features to patch context
         if self.config.add_transcriptomics and (transcriptomics is not None):
-            # print("appending transcriptomics to patch_ctx")
-            # print(f"transcriptomics: {transcriptomics}")
-            # print('patch_ctx shape is ', patch_ctx.shape)
-            # print('transcriptomics shape is ', transcriptomics.shape)
-            # concatted = torch.cat((patch_ctx, transcriptomics.clone().detach()), dim=-1)
-            # print('concatted shape is ', concatted.shape)
-            # print('self.dim is ', self.dim)
-            # print('self.hdim is ', self.hdim)
-
             # generate a random tensor of the same shape as the transcriptomics tensor
             # random_tensor = torch.rand(transcriptomics.shape).to(transcriptomics.device)
             # patch_ctx = self.combine_transcriptomics_patch_ctx(
             #     torch.cat((patch_ctx, random_tensor), dim=-1)
             # )
 
-            # TODO: Important! Put this back
-            # print(f"len transcriptomics: {len(transcriptomics)}")
-            # print(f"transcriptomics[0].shape is {transcriptomics[0].shape}")
-
             # if transcriptomics is of type list, get the first element
-            if isinstance(transcriptomics, list):
-                transcriptomics = transcriptomics[0]
+            # if isinstance(transcriptomics, list):
+            #     transcriptomics = transcriptomics[0]
 
             patch_ctx = self.combine_transcriptomics_patch_ctx(
                 torch.cat((patch_ctx, transcriptomics.clone().detach()), dim=-1)
             )
-
-            # This is a really bad way of combining, projecting to a higher dimension is always gonna be bad
-            # torch.cat((
-            #     patch_ctx,
-            #     self.transcriptomics_projector(transcriptomics.clone().detach())
-            # ), dim=-1)
-            # print('patch_ctx shape after concatenating projected transcriptomics is ', patch_ctx.shape)
 
         ################# Global aggregation
         d = self.config.trans_dim

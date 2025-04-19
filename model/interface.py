@@ -90,7 +90,7 @@ class RecursiveModel(nn.Module):
         from config import PATHSProcessorConfig
         if isinstance(config_, PATHSProcessorConfig) and config_.lstm:
             # TODO: add transcriptomics dimension to end of this
-            num_transcriptomics_features = get_num_transcriptomics_features()
+            # num_transcriptomics_features = get_num_transcriptomics_features()
             dim = config_.patch_embed_dim if config_.model_dim is None else config_.model_dim
 
             self.lstm = LSTMCell(dim, dim, config_.hierarchical_ctx_mlp_hidden_dim)

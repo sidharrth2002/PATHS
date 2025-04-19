@@ -5,6 +5,7 @@ import socket
 import os
 import logging
 import contextlib
+import hashlib      # stdlib is fine, but xxhash / blake3 are 5‑10× faster
 
 if "mac" in socket.gethostname():
     sys.path.append(
@@ -14,7 +15,7 @@ else:
     sys.path.append("/home/sn666/dissertation/src")
 
 from models.hist_to_transcriptomics import HistopathologyToTranscriptomics
-
+from models.diffusion import MultiMagnificationDiffusionModel
 
 @contextlib.contextmanager
 def suppress_logging():
@@ -29,7 +30,7 @@ def suppress_logging():
 
 # TRANSCRIPTOMICS_MODEL_PATH = "/auto/archive/tcga/sn666/trained_models/hist_to_transcriptomics/h_to_t_uni_128_b_subsetgene_then_norm_relu/epoch=9-step=3950.ckpt"
 
-TRANSCRIPTOMICS_MODEL_PATH = "/auto/archive/tcga/sn666/trained_models/hist_to_transcriptomics/h_to_t_uni_porpoise_genes_2layer/epoch=9-step=3950.ckpt"
+# TRANSCRIPTOMICS_MODEL_PATH = "/auto/archive/tcga/sn666/trained_models/hist_to_transcriptomics/h_to_t_uni_porpoise_genes_2layer/epoch=9-step=3950.ckpt"
 
 
 class MiniPatchDataset(torch.utils.data.Dataset):
@@ -55,45 +56,105 @@ def load_model(checkpoint_path: str):
     """
     Load the HistopathologyToTranscriptomics model from a checkpoint.
     """
-    model = HistopathologyToTranscriptomics.load_from_checkpoint(checkpoint_path)
+    if "hist_to_transcriptomics" in checkpoint_path:
+        model = HistopathologyToTranscriptomics.load_from_checkpoint(checkpoint_path)
+    elif "diffusion" in checkpoint_path:
+        model = MultiMagnificationDiffusionModel.load_from_checkpoint(checkpoint_path)
+    else:
+        raise ValueError(f"Unknown model type in checkpoint path: {checkpoint_path}")
     return model
 
 
-histtost = load_model(TRANSCRIPTOMICS_MODEL_PATH)
+transcriptomics_model = None
+
+"""
+This global variable is used to store the transcriptomics observations of previously 
+computed patches, so that we don't have to recompute them.
+
+Why do this?
+Because the same "high-resolution" patch can end up at multiple magnifications, and we don't want to recompute
+"""
+CACHE: dict[str, torch.Tensor] = {}     # fp16 preds on CPU to save RAM
 
 
-def get_transcriptomics_data(patch_features: torch.Tensor):
+def tensor_fingerprint(
+    t: torch.Tensor,
+    *,                         # force kw‑args
+    ndigits: int | None = None # round to this many decimal places first
+) -> str:
     """
-    For each patch, return the transcriptomics data by calling a saved HistopathologyToTranscriptomics model.
+    Return a hex string that is identical *iff* the tensor contents
+    (after optional rounding) are identical.
     """
-    # getting too noisy
-    with suppress_logging():
-        # there can be a variable number of patches passed to this function
-        num_patches = patch_features.shape[0]
-        # print(f"num_patches: {num_patches}")
+    if ndigits is not None:
+        t = torch.round(t, decimals=ndigits)
 
-        trainer_args = {
-            "logger": False,
-            "enable_progress_bar": False,
-            "enable_model_summary": False,
-        }
-        dataset = MiniPatchDataset(patch_features)
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size=num_patches)
-        if torch.cuda.is_available():
-            trainer = pl.Trainer(devices=1, **trainer_args)
-        else:
-            trainer = pl.Trainer(accelerator="cpu", **trainer_args)
+    # Make sure we are hashing a contiguous CPU view with a stable dtype.
+    # .contiguous() is a no‑op if the tensor is already C‑contiguous.
+    buf = t.detach().to(dtype=torch.float32, device="cpu", copy=False).contiguous().numpy().tobytes()
+    return hashlib.blake2b(buf, digest_size=8).hexdigest()  # 8 bytes → 16‑char hex
 
-        # print("Predicting transcriptomics data...")
-        predictions = trainer.predict(histtost, dataloaders=dataloader)
-        # print("Predictions done.")
+def get_transcriptomics_data(patch_features: torch.Tensor, transcriptomics_model_path: str) -> torch.Tensor:
+    global transcriptomics_model
+    
+    if transcriptomics_model is None:
+        # Load the model
+        print("Loading transcriptomics model...")
+        transcriptomics_model = load_model(transcriptomics_model_path)
+    
+    B, P, _ = patch_features.shape
+    device  = patch_features.device
+    out_dim = transcriptomics_model.num_outputs
+    result  = torch.empty((B, P, out_dim), device=device)
 
-        return predictions
+    # -----------------------------------------------------------------------
+    # 1) split cached vs. missing by hashing each slide tensor once
+    # -----------------------------------------------------------------------
+    missing_idx, fingerprints = [], []
 
+    for i in range(B):
+        fp = tensor_fingerprint(patch_features[i], ndigits=4)  # or None for exact
+        if fp in CACHE:                      # hit
+            result[i] = CACHE[fp].to(device)
+        else:                                # miss
+            fingerprints.append(fp)
+            missing_idx.append(i)
 
-def get_num_transcriptomics_features():
+    # -----------------------------------------------------------------------
+    # 2) run the model once for all misses
+    # -----------------------------------------------------------------------
+    if missing_idx:
+        feats  = patch_features[missing_idx]                 # (n_missing, P, 1024)
+        loader = torch.utils.data.DataLoader(
+            MiniPatchDataset(feats), batch_size=len(missing_idx)
+        )
+
+        trainer = pl.Trainer(
+            accelerator="gpu" if torch.cuda.is_available() else "cpu",
+            devices=1,
+            logger=False, enable_progress_bar=False, enable_model_summary=False,
+        )
+
+        with suppress_logging():
+            preds = torch.cat(trainer.predict(transcriptomics_model, dataloaders=loader), dim=0)  # (n_missing, P, out_dim)
+
+        # write to output and cache
+        result[missing_idx] = preds
+        for fp, pred in zip(fingerprints, preds):
+            CACHE[fp] = pred.to(dtype=torch.float16, device="cpu")  # light‑weight cache
+
+    return result
+
+def get_num_transcriptomics_features(transcriptomics_model_path: str) -> int:
+    global transcriptomics_model
+    
+    if transcriptomics_model is None:
+        # Load the model
+        print("Loading transcriptomics model...")
+        transcriptomics_model = load_model(transcriptomics_model_path)
+        
     # TODO: make this dynamic idk
-    return histtost.num_outputs
+    return transcriptomics_model.num_outputs
 
 
 def load(path):

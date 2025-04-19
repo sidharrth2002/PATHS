@@ -117,7 +117,7 @@ def padding_mask(xs: torch.Tensor, lengths: torch.LongTensor):
 #     out[inds] = network_out
 #     return out
 
-def apply_to_non_padded(network: Callable, xs: torch.Tensor, transcriptomics: torch.Tensor, inds: torch.BoolTensor, output_dim: int):
+def apply_to_non_padded(network: Callable, xs: torch.Tensor, inds: torch.BoolTensor, output_dim: int):
     """
     Applies a module to only the non-padded indices in sequence `xs`. Padded locations are populated with zeros.
     `inds` gives the non-padded indices.
@@ -125,14 +125,29 @@ def apply_to_non_padded(network: Callable, xs: torch.Tensor, transcriptomics: to
     """
     batch_size, max_seq = xs.shape[:2]
     out = torch.zeros((batch_size, max_seq, output_dim), device=xs.device)
-    print(f"transcriptomics[0] shape: {transcriptomics[0].shape}")
-    print(f"inds: {inds}")
-    transcriptomics = transcriptomics[0].to(device=xs.device)
     out[inds] = network({
         "contextualised_features": xs[inds], 
-        "transcriptomics": transcriptomics[inds]
     })
     return out
+
+# def apply_to_non_padded(network: Callable, xs: torch.Tensor, transcriptomics: torch.Tensor, inds: torch.BoolTensor, output_dim: int):
+#     """
+#     Applies a module to only the non-padded indices in sequence `xs`. Padded locations are populated with zeros.
+#     `inds` gives the non-padded indices.
+#     `network`'s output must be of dimension `output_dim`.
+#     """
+#     batch_size, max_seq = xs.shape[:2]
+#     out = torch.zeros((batch_size, max_seq, output_dim), device=xs.device)
+#     print(f"xs shape: {xs.shape}")
+#     print(f"transcriptomics shape: {transcriptomics.shape}")
+#     # print(f"transcriptomics[0] shape: {transcriptomics[0].shape}")
+#     # print(f"inds: {inds}")
+#     # transcriptomics = transcriptomics[0].to(device=xs.device)
+#     out[inds] = network({
+#         "contextualised_features": xs[inds], 
+#         "transcriptomics": transcriptomics[inds]
+#     })
+#     return out
 
 
 def next_multiple(n: int, m: int):
@@ -246,7 +261,7 @@ def inference(model, depth, power, batch, importance_penalty, task: str):
 
 # todo; should probably just move somewhere else to prevent circular imports
 def inference_end2end(num_levels, keep_patches, model, base_power, batch, task: str, use_mixed_precision: bool = False,
-                      random_rec_baseline: bool = False, magnification_factor: int = 2):
+                      random_rec_baseline: bool = False, magnification_factor: int = 2, transcriptomics_type: str = "none", transcriptomics_model_path: str = None):
     from data_utils import patch_batch  # circular imports...
     from data_utils.slide import PreprocessedSlide
     from data_utils.dataset import collate_fn
@@ -260,7 +275,7 @@ def inference_end2end(num_levels, keep_patches, model, base_power, batch, task: 
         locs_cpu = batch["locs"]
 
         with autocast(enabled=use_mixed_precision):
-            data = patch_batch.from_batch(batch, device)
+            data = patch_batch.from_batch(batch, device, transcriptomics_type=transcriptomics_type, transcriptomics_model_path=transcriptomics_model_path)
             out = model(i, data)
 
             importance = out["importance"]
@@ -281,7 +296,10 @@ def inference_end2end(num_levels, keep_patches, model, base_power, batch, task: 
                 ind = i if magnification_factor == 2 else 2 * i
 
                 x = slide.iter(ind, data.num_ims[j], locs_cpu[j], data.ctx_slide[j], data.ctx_patch[j], importance[j],
-                               new_ctx_slide[j], new_ctx_patch[j], keep_patches[i], imp_cpu[j])
+                               new_ctx_slide[j], new_ctx_patch[j], keep_patches[i], imp_cpu[j], 
+                               # only compute leaves if the transcriptomics type is highest-magnification
+                               # if not, we do inference at every magnification
+                               return_leaf=(transcriptomics_type == "highest-magnification"), leaf_frac=0.8)
 
                 if magnification_factor == 4:
                     new_fts = x["fts"]
@@ -291,6 +309,14 @@ def inference_end2end(num_levels, keep_patches, model, base_power, batch, task: 
                     num_ims = new_fts.shape[0]
                     x = slide.iter(ind + 1, num_ims, locs, ctx_slide, ctx_patch, None,None, None, -1)
 
+                # print(f"Slide {j} at level {i}")
+                # print(f"Power: {power}")
+                # for k, v in x.items():
+                #     # if of type torch.tensor
+                #     if isinstance(v, torch.Tensor):
+                #         print(f"{k}: {v.shape}")
+                # print(f"x parent_inds: {x['parent_inds'].shape}")
+                
                 new_batch.append(x)
 
             batch = collate_fn(new_batch)

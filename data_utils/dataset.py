@@ -274,6 +274,13 @@ class SlideDataset(dutils.Dataset):
 
 def collate_fn(xs):
     """Special collate_fn to pad the fields which have variable length."""
+    
+    # NOTE: IMPORTANT: pull out all leaf fields so default_collate never sees them
+    leaf_fields = {}
+    leaf_keys = [k for k in xs[0].keys() if k.startswith("leaf_")]
+    for k in leaf_keys:
+        leaf_fields[k] = [sample.pop(k) for sample in xs]
+
     fts = [i.pop("fts") for i in xs]                  # (variable) x D
     locs = [i.pop("locs") for i in xs]                # (variable) x 2
     ctx_patch = [i.pop("ctx_patch") for i in xs]      # (variable) x K x D
@@ -309,4 +316,14 @@ def collate_fn(xs):
     else:
         extra = {}
 
-    return default_collate(xs) | padded_data | extra
+    # print shape of each field
+    # for k, v in padded_data.items():
+    #     print(f"{k}: {v.shape}")
+
+    batch = default_collate(xs) | padded_data | extra
+    
+    # 3) re‑attach the leaf fields verbatim
+    for k, v in leaf_fields.items():
+        batch[k] = v
+    
+    return batch

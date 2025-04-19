@@ -39,7 +39,9 @@ class PATHSProcessorConfig(ModelConfig):
     lstm: bool = True
     
     add_transcriptomics: bool = False
-
+    transcriptomics_type: str = "none" # by default, no transcriptomics -- but this should either be multi-magnification or highest-magnification
+    transcriptomics_model_path: str = None  # path to the transcriptomics model
+    
     random_rec_baseline: bool = False  # random patch selection. just used for ablation
 
 

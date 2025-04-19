@@ -92,14 +92,15 @@ class PatchBatch:
         self.valid_inds = inds
 
 
-def from_batch(batch: Dict, device) -> PatchBatch:
-    # TODO: Extract transcriptomics here
-    # print(f"batch keys: {batch.keys()}")
-    # print(f"batch fts shape: {batch['fts'].shape}")
-    transcriptomics = get_transcriptomics_data(batch['fts'])
-    # print(f"transcriptomics: {transcriptomics[0].shape}")
-    batch['transcriptomics'] = transcriptomics[0]
-    # print(f"transcriptomics in from_batch: {batch['transcriptomics']}")
+def from_batch(batch: Dict, device, transcriptomics_type: str, transcriptomics_model_path: str) -> PatchBatch:
+    if transcriptomics_type == 'multi-magnification':
+        # store unique identifiers for each patch, made up of slide id and patch locs
+        # get transcriptomics based on the patch features
+        transcriptomics = get_transcriptomics_data(batch['fts'], transcriptomics_model_path)
+        batch['transcriptomics'] = transcriptomics
+
+    # TODO: elif transcriptomics_type == 'highest-magnification':
+
     batch = {i: utils.todevice(j, device) for i, j in batch.items()}
     return PatchBatch(**batch)
 
@@ -128,9 +129,7 @@ def from_raw_slide(slide: RawSlide, im_enc, transform, device=None) -> PatchBatc
     with torch.no_grad():
         fts = im_enc(transform(slide.patches.to(device)))
 
-    print(f"fts shape: {fts.shape}")
     transcriptomics = get_transcriptomics_data(fts)
-    print(f"transcriptomics shape after predict: {transcriptomics[0].shape}")
 
     num_ims = torch.LongTensor([slide.locs.size(0)]).to(device)
     return PatchBatch(

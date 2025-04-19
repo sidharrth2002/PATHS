@@ -270,13 +270,72 @@ class PreprocessedSlide:
         self.fts[0] = fts0[locs[:, 0], locs[:, 1]]
 
         self.size_pixels = None  # total slide size at this power in pixels
+        
+        self.num_levels = num_levels
 
     def load_patches(self, wsi=None):
         assert wsi is None
         return
+    
+    def _get_leaf_children(self, locs: torch.Tensor, start_level: int, parent_inds: torch.Tensor):
+        """
+        Recursively descend from `start_level` to the deepest **leaf** level, returning
+        (leaf_locs, leaf_parent_inds, leaf_feats).
+        """
+        level = start_level
+        current_locs = locs
+        current_parents = parent_inds
+        
+        while level < self.num_levels - 1:
+            kwargs = {"dtype": current_locs.dtype, "device": current_locs.device}
+            
+            # expland 4x like in the iter() method
+            next_locs = current_locs * torch.tensor([2, 2], **kwargs)
+            next_locs = torch.cat((
+                next_locs,
+                next_locs + torch.tensor([0, 1], **kwargs),
+                next_locs + torch.tensor([1, 0], **kwargs),
+                next_locs + torch.tensor([1, 1], **kwargs)
+            ), dim=0)
+            
+            next_parents = current_parents.repeat_interleave(4, dim=0)
+            
+            # keep in-bounds and non-background patches
+            fts_m1 = self.fts[level + 1]
+            H, W, _ = fts_m1.shape
+            inb = torch.logical_and(next_locs[:, 0] < H, next_locs[:, 1] < W)
+            
+            # --- safe indexing: rewrite o‑o‑b rows to (0,0) first
+            next_locs_safe = next_locs.clone()
+            next_locs_safe[~inb] = 0
+            bg = fts_m1[next_locs_safe[:, 0], next_locs_safe[:, 1]].sum(dim=1) != 0 # (0,0) is always within bounds
+            # bg = fts_m1[next_locs[:, 0], next_locs[:, 1]].sum(dim=1) != 0
+            # print("bg", bg)
+            keep = torch.logical_and(inb, bg)
+            
+            current_locs = next_locs[keep]
+            current_parents = next_parents[keep]
+            level += 1
+            
+            # edge case - all filtered out -> fall back to "all tiles"
+            if current_locs.numel() == 0:
+                print("reached edge case")
+                H, W, _ = fts_m1.shape
+                current_locs = torch.stack(torch.meshgrid(
+                    torch.arange(H, device=fts_m1.device),
+                    torch.arange(W, device=fts_m1.device),
+                    indexing="ij"), dim=-1).view(-1, 2)
+                current_parents = current_parents.new_tensor(
+                    torch.arange(current_locs.size(0))
+                )
+                os._exit(0)
+                            
+        # gather features on leaf level
+        leaf_fts = self.fts[-1][current_locs[:, 0], current_locs[:, 1]]
+        return current_locs, current_parents, leaf_fts
 
     def iter(self, magnification_index: int, npatches: int, locs, ctx_slide, ctx_patch, importance, new_ctx_slide,
-             new_ctx_patch, keep_patches: int = -1, imp_cpu=None):
+             new_ctx_patch, keep_patches: int = -1, imp_cpu=None, return_leaf: bool = False, leaf_frac: float = 1.0):
         """Iterates data from magnification level `index` to `index+1`"""
         locs //= self.patch_size
 
@@ -366,13 +425,109 @@ class PreprocessedSlide:
             ctx_patch = ctx_patch[filter]
             new_fts = fts[new_locs[:, 0], new_locs[:, 1]]
 
-        return {
+        ret = {
             "fts": new_fts,
             "ctx_patch": ctx_patch,
             "ctx_slide": ctx_slide,
             "locs": new_locs * self.patch_size,
-            "parent_inds": parent_inds
+            "parent_inds": parent_inds,
+            "slide_id": self.slide_id,
         }
+        
+        if return_leaf:
+            # 1) fetch all leaves down to highest level
+            # leaf_locs, leaf_parent_inds, leaf_fts = self._get_leaf_children(
+            #     new_locs, magnification_index + 1, parent_inds
+            # )
+            mapping = torch.arange(new_locs.size(0), dtype=torch.long, device=new_locs.device)
+            leaf_locs, leaf_parent_inds, leaf_fts = self._get_leaf_children(
+                new_locs, magnification_index + 1, mapping
+            )
+
+            # print("leaf parent inds", leaf_parent_inds)
+
+            # 2) compute parent counts & max
+            # num_parents  = int(leaf_parent_inds.max().item()) + 1            
+            # num_parents = new_fts.size(0)
+
+            P = new_fts.size(0)
+            # valid = leaf_parent_inds < P
+
+            # if (leaf_parent_inds >= P).any():
+            #     print(f"P: {P}, leaf_parent_inds: {leaf_parent_inds}")
+            #     raise RuntimeError("got impossible parent index; please debug fallback logic")
+
+            # leaf_locs = leaf_locs[valid]
+            # leaf_fts = leaf_fts[valid]
+            # leaf_parent_inds = leaf_parent_inds[valid]
+            num_parents = P
+
+            leaf_counts  = torch.bincount(leaf_parent_inds, minlength=num_parents)
+            max_children = int(leaf_counts.max().item())
+
+            # to keep record of which parent patches actually have leaves
+            # full_counts = torch.bincount(leaf_parent_inds, minlength=new_fts.size(0))
+            # has_leaves = full_counts > 0
+            # print("has leaves", has_leaves)
+
+            # 3) allocate full leaf tensors
+            D_feat = leaf_fts.size(1)
+            device = leaf_fts.device
+            leaf_locs_grouped = torch.zeros((num_parents, max_children, 2),
+                                            dtype=leaf_locs.dtype, device=device)
+            leaf_fts_grouped  = torch.zeros((num_parents, max_children, D_feat),
+                                            dtype=leaf_fts.dtype,    device=device)
+            leaf_mask         = torch.zeros((num_parents, max_children),
+                                            dtype=torch.bool,        device=device)
+
+            # 4) scatter all leaves into groups
+            write_ptr = torch.zeros(num_parents, dtype=torch.long, device=device)
+            for idx in range(leaf_parent_inds.numel()):
+                p = leaf_parent_inds[idx].item()
+                w = write_ptr[p].item()
+                leaf_locs_grouped[p, w] = leaf_locs[idx] * self.patch_size
+                leaf_fts_grouped[p, w] = leaf_fts[idx]
+                leaf_mask[p, w] = True
+                write_ptr[p] += 1
+
+            # 5) per‑parent fraction‑based pruning
+            keep_counts = (leaf_counts.float() * leaf_frac).ceil().long().clamp(min=1)
+            new_max     = int(keep_counts.max().item())
+
+            pruned_locs = torch.zeros((num_parents, new_max, 2),
+                                      dtype=leaf_locs.dtype, device=device)
+            pruned_fts  = torch.zeros((num_parents, new_max, D_feat),
+                                      dtype=leaf_fts.dtype,    device=device)
+            pruned_mask = torch.zeros((num_parents, new_max),
+                                      dtype=torch.bool,        device=device)
+
+            for p in range(num_parents):
+                K = keep_counts[p].item()
+                # print(f"Only keeping {K} of {leaf_counts[p].item()} for parent {p}")
+                real_idxs = torch.nonzero(leaf_mask[p], as_tuple=True)[0]
+                if real_idxs.numel() > K:
+                    sel = real_idxs[torch.randperm(real_idxs.numel(), device=device)[:K]]
+                else:
+                    sel = real_idxs
+                pruned_locs[p, :sel.numel()] = leaf_locs_grouped[p, sel]
+                pruned_fts [p, :sel.numel()] = leaf_fts_grouped [p, sel]
+                pruned_mask[p, :sel.numel()] = True
+
+            # 6) overwrite with pruned versions
+            leaf_locs_grouped = pruned_locs
+            leaf_fts_grouped  = pruned_fts
+            leaf_mask         = pruned_mask
+            leaf_counts       = keep_counts
+
+            # 7) add to return dict
+            ret.update({
+                "leaf_locs_grouped": leaf_locs_grouped,  # (N′, M′, 2)
+                "leaf_fts_grouped":  leaf_fts_grouped,   # (N′, M′, D_feat)
+                "leaf_mask":         leaf_mask,          # (N′, M′)
+                "leaf_counts":       leaf_counts,        # (N′)
+            })
+
+        return ret
 
     def recurse(self, *args, **kwargs):
         raise NotImplementedError
@@ -395,7 +550,8 @@ class PreprocessedSlide:
             "ctx_patch": ctx_patch,
 
             # Fixed length
-            "ctx_slide": self.ctx_slide
+            "ctx_slide": self.ctx_slide,
+            "slide_id": self.slide_id
         } | kwargs
 
 
